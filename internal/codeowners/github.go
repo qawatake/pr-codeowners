@@ -1,4 +1,4 @@
-package main
+package codeowners
 
 import (
 	"context"
@@ -13,9 +13,29 @@ import (
 
 // PRInfo contains PR metadata
 type PRInfo struct {
-	Owner    string
-	Repo     string
+	Owner      string
+	Repo       string
 	BaseBranch string
+}
+
+// OwnerInfo represents an owner with their files and assigned reviewers
+type OwnerInfo struct {
+	Files     []string `json:"files"`
+	Reviewers []string `json:"reviewers,omitempty"`
+}
+
+// prData holds all fetched PR data
+type prData struct {
+	info       *PRInfo
+	files      []string
+	codeowners string
+	reviewers  []string
+}
+
+// teamMemberResult holds the result of fetching team members
+type teamMemberResult struct {
+	owner   string
+	members []string
 }
 
 // GetPRInfo fetches PR information using gh CLI
@@ -36,14 +56,14 @@ func GetPRInfo(ctx context.Context, prRef string) (*PRInfo, error) {
 	}
 
 	return &PRInfo{
-		Owner:    parts[0],
-		Repo:     parts[1],
+		Owner:      parts[0],
+		Repo:       parts[1],
 		BaseBranch: strings.Join(parts[2:], "/"),
 	}, nil
 }
 
-// GetPRFiles fetches the list of changed files in a PR
-func GetPRFiles(ctx context.Context, prRef string) ([]string, error) {
+// getPRFiles fetches the list of changed files in a PR
+func getPRFiles(ctx context.Context, prRef string) ([]string, error) {
 	cmd := exec.CommandContext(ctx, "gh", "pr", "diff", prRef, "--name-only")
 
 	out, err := cmd.Output()
@@ -62,8 +82,8 @@ func GetPRFiles(ctx context.Context, prRef string) ([]string, error) {
 	return files, nil
 }
 
-// FetchCodeowners fetches CODEOWNERS content from the repository
-func FetchCodeowners(ctx context.Context, info *PRInfo) (string, error) {
+// fetchCodeowners fetches CODEOWNERS content from the repository
+func fetchCodeowners(ctx context.Context, info *PRInfo) (string, error) {
 	paths := []string{".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"}
 
 	p := pool.NewWithResults[string]().WithErrors()
@@ -111,14 +131,6 @@ func fetchFileContent(ctx context.Context, info *PRInfo, path string) (string, e
 	return string(decoded), nil
 }
 
-// prData holds all fetched PR data
-type prData struct {
-	Info      *PRInfo
-	Files     []string
-	Codeowners string
-	Reviewers []string
-}
-
 // FetchPRDataWithReviewers fetches PR info, files, CODEOWNERS, and reviewers all in parallel
 func FetchPRDataWithReviewers(ctx context.Context, prRef string) (*PRInfo, []string, string, []string, error) {
 	p := pool.New().WithErrors()
@@ -127,25 +139,25 @@ func FetchPRDataWithReviewers(ctx context.Context, prRef string) (*PRInfo, []str
 
 	p.Go(func() error {
 		info, err := GetPRInfo(ctx, prRef)
-		data.Info = info
+		data.info = info
 		return err
 	})
 
 	p.Go(func() error {
-		files, err := GetPRFiles(ctx, prRef)
-		data.Files = files
+		files, err := getPRFiles(ctx, prRef)
+		data.files = files
 		return err
 	})
 
 	p.Go(func() error {
-		codeowners, err := FetchCodeownersFromPR(ctx, prRef)
-		data.Codeowners = codeowners
+		codeowners, err := fetchCodeownersFromPR(ctx, prRef)
+		data.codeowners = codeowners
 		return err
 	})
 
 	p.Go(func() error {
-		reviewers, err := GetPRReviewers(ctx, prRef)
-		data.Reviewers = reviewers
+		reviewers, err := getPRReviewers(ctx, prRef)
+		data.reviewers = reviewers
 		return err
 	})
 
@@ -153,11 +165,11 @@ func FetchPRDataWithReviewers(ctx context.Context, prRef string) (*PRInfo, []str
 		return nil, nil, "", nil, err
 	}
 
-	return data.Info, data.Files, data.Codeowners, data.Reviewers, nil
+	return data.info, data.files, data.codeowners, data.reviewers, nil
 }
 
-// FetchCodeownersFromPR fetches CODEOWNERS using PR reference directly
-func FetchCodeownersFromPR(ctx context.Context, prRef string) (string, error) {
+// fetchCodeownersFromPR fetches CODEOWNERS using PR reference directly
+func fetchCodeownersFromPR(ctx context.Context, prRef string) (string, error) {
 	// Get repo info from PR
 	cmd := exec.CommandContext(ctx, "gh", "pr", "view", prRef,
 		"--json", "headRepository,headRepositoryOwner,baseRefName",
@@ -180,38 +192,11 @@ func FetchCodeownersFromPR(ctx context.Context, prRef string) (string, error) {
 		BaseBranch: strings.Join(parts[2:], "/"),
 	}
 
-	return FetchCodeowners(ctx, info)
+	return fetchCodeowners(ctx, info)
 }
 
-// BuildOwnerFilesMap builds a map from owner to files
-func BuildOwnerFilesMap(matcher *Matcher, files []string) map[string][]string {
-	result := make(map[string][]string)
-
-	for _, file := range files {
-		owners := matcher.Match(file)
-		if len(owners) == 0 {
-			result["(no owner)"] = append(result["(no owner)"], file)
-		} else {
-			for _, owner := range owners {
-				result[owner] = append(result[owner], file)
-			}
-		}
-	}
-
-	return result
-}
-
-// ToJSON converts the result map to JSON
-func ToJSON(data map[string][]string) (string, error) {
-	bytes, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		return "", err
-	}
-	return string(bytes), nil
-}
-
-// GetPRReviewers fetches the list of reviewers for a PR (both requested and those who approved)
-func GetPRReviewers(ctx context.Context, prRef string) ([]string, error) {
+// getPRReviewers fetches the list of reviewers for a PR (both requested and those who approved)
+func getPRReviewers(ctx context.Context, prRef string) ([]string, error) {
 	// Get reviewRequests (pending) and reviews with APPROVED state
 	cmd := exec.CommandContext(ctx, "gh", "pr", "view", prRef,
 		"--json", "reviewRequests,reviews",
@@ -233,9 +218,9 @@ func GetPRReviewers(ctx context.Context, prRef string) ([]string, error) {
 	return reviewers, nil
 }
 
-// GetTeamMembers fetches the members of a GitHub team
-func GetTeamMembers(ctx context.Context, owner, teamSlug string) ([]string, error) {
-	endpoint := fmt.Sprintf("orgs/%s/teams/%s/members", owner, teamSlug)
+// getTeamMembers fetches the members of a GitHub team
+func getTeamMembers(ctx context.Context, org, teamSlug string) ([]string, error) {
+	endpoint := fmt.Sprintf("orgs/%s/teams/%s/members", org, teamSlug)
 	cmd := exec.CommandContext(ctx, "gh", "api", endpoint, "--jq", ".[].login")
 
 	out, err := cmd.Output()
@@ -254,20 +239,8 @@ func GetTeamMembers(ctx context.Context, owner, teamSlug string) ([]string, erro
 	return members, nil
 }
 
-// OwnerInfo represents an owner with their files and assigned reviewers
-type OwnerInfo struct {
-	Files     []string `json:"files"`
-	Reviewers []string `json:"reviewers,omitempty"`
-}
-
-// teamMemberResult holds the result of fetching team members
-type teamMemberResult struct {
-	Owner   string
-	Members []string
-}
-
 // BuildOwnerFilesMapWithReviewers builds a map from owner to files and matching reviewers
-func BuildOwnerFilesMapWithReviewers(ctx context.Context, matcher *Matcher, files []string, reviewers []string, repoOwner string) map[string]*OwnerInfo {
+func BuildOwnerFilesMapWithReviewers(ctx context.Context, matcher *Matcher, files []string, reviewers []string) map[string]*OwnerInfo {
 	// First, build the basic owner -> files map
 	ownerFiles := make(map[string][]string)
 
@@ -296,20 +269,20 @@ func BuildOwnerFilesMapWithReviewers(ctx context.Context, matcher *Matcher, file
 		p.Go(func() teamMemberResult {
 			parts := strings.SplitN(strings.TrimPrefix(owner, "@"), "/", 2)
 			if len(parts) == 2 {
-				members, err := GetTeamMembers(ctx, parts[0], parts[1])
+				members, err := getTeamMembers(ctx, parts[0], parts[1])
 				if err == nil {
-					return teamMemberResult{Owner: owner, Members: members}
+					return teamMemberResult{owner: owner, members: members}
 				}
 			}
-			return teamMemberResult{Owner: owner}
+			return teamMemberResult{owner: owner}
 		})
 	}
 
 	// Build team members map from results
 	teamMembers := make(map[string][]string)
 	for _, r := range p.Wait() {
-		if len(r.Members) > 0 {
-			teamMembers[r.Owner] = r.Members
+		if len(r.members) > 0 {
+			teamMembers[r.owner] = r.members
 		}
 	}
 
@@ -350,8 +323,8 @@ func BuildOwnerFilesMapWithReviewers(ctx context.Context, matcher *Matcher, file
 	return result
 }
 
-// ToJSONWithReviewers converts the result map to JSON
-func ToJSONWithReviewers(data map[string]*OwnerInfo) (string, error) {
+// ToJSON converts the result map to JSON
+func ToJSON(data map[string]*OwnerInfo) (string, error) {
 	bytes, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		return "", err

@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"time"
+
+	"github.com/qawatake/pr-codeowners/internal/codeowners"
 )
 
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -58,7 +60,7 @@ func main() {
 	logf("データを並列取得中: %s", prRef)
 
 	// Fetch all data in parallel (PR info, files, CODEOWNERS, reviewers)
-	info, files, codeowners, reviewers, err := FetchPRDataWithReviewers(ctx, prRef)
+	info, files, codeownersContent, reviewers, err := codeowners.FetchPRDataWithReviewers(ctx, prRef)
 	if err != nil {
 		close(stopSpinner)
 		log.Fatalf("Error: %v", err)
@@ -67,15 +69,15 @@ func main() {
 	logf("取得完了 - リポジトリ: %s/%s, ファイル数: %d, レビュアー数: %d", info.Owner, info.Repo, len(files), len(reviewers))
 
 	// Parse CODEOWNERS and match files with reviewers
-	matcher := ParseCodeowners(codeowners)
-	result := BuildOwnerFilesMapWithReviewers(ctx, matcher, files, reviewers, info.Owner)
+	matcher := codeowners.ParseCodeowners(codeownersContent)
+	result := codeowners.BuildOwnerFilesMapWithReviewers(ctx, matcher, files, reviewers)
 
 	// Stop spinner
 	close(stopSpinner)
 	time.Sleep(100 * time.Millisecond) // Wait for spinner cleanup
 
 	// Output JSON
-	jsonOutput, err := ToJSONWithReviewers(result)
+	jsonOutput, err := codeowners.ToJSON(result)
 	if err != nil {
 		log.Fatalf("Error creating JSON: %v", err)
 	}

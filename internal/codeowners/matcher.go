@@ -1,4 +1,4 @@
-package main
+package codeowners
 
 import (
 	"bufio"
@@ -6,20 +6,20 @@ import (
 	"strings"
 )
 
-// Rule represents a single CODEOWNERS rule
-type Rule struct {
-	Pattern string
-	Owners  []string
+// rule represents a single CODEOWNERS rule
+type rule struct {
+	pattern string
+	owners  []string
 }
 
 // Matcher matches files against CODEOWNERS rules
 type Matcher struct {
-	rules []Rule
+	rules []rule
 }
 
 // ParseCodeowners parses CODEOWNERS content and returns a Matcher
 func ParseCodeowners(content string) *Matcher {
-	var rules []Rule
+	var rules []rule
 	scanner := bufio.NewScanner(strings.NewReader(content))
 
 	for scanner.Scan() {
@@ -38,9 +38,9 @@ func ParseCodeowners(content string) *Matcher {
 		pattern := parts[0]
 		owners := parts[1:]
 
-		rules = append(rules, Rule{
-			Pattern: pattern,
-			Owners:  owners,
+		rules = append(rules, rule{
+			pattern: pattern,
+			owners:  owners,
 		})
 	}
 
@@ -52,9 +52,9 @@ func ParseCodeowners(content string) *Matcher {
 func (m *Matcher) Match(filePath string) []string {
 	var matchedOwners []string
 
-	for _, rule := range m.rules {
-		if matchPattern(rule.Pattern, filePath) {
-			matchedOwners = rule.Owners
+	for _, r := range m.rules {
+		if matchPattern(r.pattern, filePath) {
+			matchedOwners = r.owners
 		}
 	}
 

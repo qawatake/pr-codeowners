@@ -1,0 +1,2 @@
+i:
+	go install .

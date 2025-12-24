@@ -7,9 +7,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
-	"sync"
 
-	"github.com/sourcegraph/conc"
+	"github.com/sourcegraph/conc/pool"
 )
 
 // PRInfo contains PR metadata
@@ -67,33 +66,20 @@ func GetPRFiles(ctx context.Context, prRef string) ([]string, error) {
 func FetchCodeowners(ctx context.Context, info *PRInfo) (string, error) {
 	paths := []string{".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"}
 
-	type result struct {
-		content string
-		path    string
-	}
-
-	resultCh := make(chan result, len(paths))
-
-	var wg conc.WaitGroup
+	p := pool.NewWithResults[string]().WithErrors()
 	for _, path := range paths {
-		path := path
-		wg.Go(func() {
-			content, err := fetchFileContent(ctx, info, path)
-			if err == nil && content != "" {
-				resultCh <- result{content: content, path: path}
-			}
+		p.Go(func() (string, error) {
+			return fetchFileContent(ctx, info, path)
 		})
 	}
 
-	// Wait in a separate goroutine and close channel when done
-	go func() {
-		wg.Wait()
-		close(resultCh)
-	}()
+	results, _ := p.Wait()
 
-	// Return the first successful result
-	for r := range resultCh {
-		return r.content, nil
+	// Return the first non-empty result
+	for _, content := range results {
+		if content != "" {
+			return content, nil
+		}
 	}
 
 	return "", fmt.Errorf("CODEOWNERS file not found in %s/%s", info.Owner, info.Repo)
@@ -125,103 +111,49 @@ func fetchFileContent(ctx context.Context, info *PRInfo, path string) (string, e
 	return string(decoded), nil
 }
 
-// FetchPRData fetches PR info, files, and CODEOWNERS all in parallel
-func FetchPRData(ctx context.Context, prRef string) (*PRInfo, []string, string, error) {
-	var info *PRInfo
-	var infoErr error
-
-	var files []string
-	var filesErr error
-
-	var codeowners string
-	var codeownersErr error
-
-	// All 3 requests in parallel
-	var wg conc.WaitGroup
-
-	// 1. PR info
-	wg.Go(func() {
-		info, infoErr = GetPRInfo(ctx, prRef)
-	})
-
-	// 2. Changed files
-	wg.Go(func() {
-		files, filesErr = GetPRFiles(ctx, prRef)
-	})
-
-	// 3. CODEOWNERS - get repo info from PR URL directly
-	wg.Go(func() {
-		codeowners, codeownersErr = FetchCodeownersFromPR(ctx, prRef)
-	})
-
-	wg.Wait()
-
-	if infoErr != nil {
-		return nil, nil, "", infoErr
-	}
-	if filesErr != nil {
-		return nil, nil, "", filesErr
-	}
-	if codeownersErr != nil {
-		return nil, nil, "", codeownersErr
-	}
-
-	return info, files, codeowners, nil
+// prData holds all fetched PR data
+type prData struct {
+	Info      *PRInfo
+	Files     []string
+	Codeowners string
+	Reviewers []string
 }
 
 // FetchPRDataWithReviewers fetches PR info, files, CODEOWNERS, and reviewers all in parallel
 func FetchPRDataWithReviewers(ctx context.Context, prRef string) (*PRInfo, []string, string, []string, error) {
-	var info *PRInfo
-	var infoErr error
+	p := pool.New().WithErrors()
 
-	var files []string
-	var filesErr error
+	var data prData
 
-	var codeowners string
-	var codeownersErr error
-
-	var reviewers []string
-	var reviewersErr error
-
-	// All 4 requests in parallel
-	var wg conc.WaitGroup
-
-	// 1. PR info
-	wg.Go(func() {
-		info, infoErr = GetPRInfo(ctx, prRef)
+	p.Go(func() error {
+		info, err := GetPRInfo(ctx, prRef)
+		data.Info = info
+		return err
 	})
 
-	// 2. Changed files
-	wg.Go(func() {
-		files, filesErr = GetPRFiles(ctx, prRef)
+	p.Go(func() error {
+		files, err := GetPRFiles(ctx, prRef)
+		data.Files = files
+		return err
 	})
 
-	// 3. CODEOWNERS - get repo info from PR URL directly
-	wg.Go(func() {
-		codeowners, codeownersErr = FetchCodeownersFromPR(ctx, prRef)
+	p.Go(func() error {
+		codeowners, err := FetchCodeownersFromPR(ctx, prRef)
+		data.Codeowners = codeowners
+		return err
 	})
 
-	// 4. Reviewers
-	wg.Go(func() {
-		reviewers, reviewersErr = GetPRReviewers(ctx, prRef)
+	p.Go(func() error {
+		reviewers, err := GetPRReviewers(ctx, prRef)
+		data.Reviewers = reviewers
+		return err
 	})
 
-	wg.Wait()
-
-	if infoErr != nil {
-		return nil, nil, "", nil, infoErr
-	}
-	if filesErr != nil {
-		return nil, nil, "", nil, filesErr
-	}
-	if codeownersErr != nil {
-		return nil, nil, "", nil, codeownersErr
-	}
-	if reviewersErr != nil {
-		return nil, nil, "", nil, reviewersErr
+	if err := p.Wait(); err != nil {
+		return nil, nil, "", nil, err
 	}
 
-	return info, files, codeowners, reviewers, nil
+	return data.Info, data.Files, data.Codeowners, data.Reviewers, nil
 }
 
 // FetchCodeownersFromPR fetches CODEOWNERS using PR reference directly
@@ -328,6 +260,12 @@ type OwnerInfo struct {
 	Reviewers []string `json:"reviewers,omitempty"`
 }
 
+// teamMemberResult holds the result of fetching team members
+type teamMemberResult struct {
+	Owner   string
+	Members []string
+}
+
 // BuildOwnerFilesMapWithReviewers builds a map from owner to files and matching reviewers
 func BuildOwnerFilesMapWithReviewers(ctx context.Context, matcher *Matcher, files []string, reviewers []string, repoOwner string) map[string]*OwnerInfo {
 	// First, build the basic owner -> files map
@@ -344,29 +282,36 @@ func BuildOwnerFilesMapWithReviewers(ctx context.Context, matcher *Matcher, file
 		}
 	}
 
-	// Get team members for each team owner in parallel
-	teamMembers := make(map[string][]string)
-	var mu sync.Mutex
-	var wg conc.WaitGroup
-
+	// Collect team owners
+	var teamOwners []string
 	for owner := range ownerFiles {
-		owner := owner
-		// Check if it's a team (format: @org/team-name)
 		if strings.HasPrefix(owner, "@") && strings.Contains(owner, "/") {
-			wg.Go(func() {
-				parts := strings.SplitN(strings.TrimPrefix(owner, "@"), "/", 2)
-				if len(parts) == 2 {
-					members, err := GetTeamMembers(ctx, parts[0], parts[1])
-					if err == nil {
-						mu.Lock()
-						teamMembers[owner] = members
-						mu.Unlock()
-					}
-				}
-			})
+			teamOwners = append(teamOwners, owner)
 		}
 	}
-	wg.Wait()
+
+	// Get team members for each team owner in parallel
+	p := pool.NewWithResults[teamMemberResult]()
+	for _, owner := range teamOwners {
+		p.Go(func() teamMemberResult {
+			parts := strings.SplitN(strings.TrimPrefix(owner, "@"), "/", 2)
+			if len(parts) == 2 {
+				members, err := GetTeamMembers(ctx, parts[0], parts[1])
+				if err == nil {
+					return teamMemberResult{Owner: owner, Members: members}
+				}
+			}
+			return teamMemberResult{Owner: owner}
+		})
+	}
+
+	// Build team members map from results
+	teamMembers := make(map[string][]string)
+	for _, r := range p.Wait() {
+		if len(r.Members) > 0 {
+			teamMembers[r.Owner] = r.Members
+		}
+	}
 
 	// Build the result with reviewers
 	result := make(map[string]*OwnerInfo)
